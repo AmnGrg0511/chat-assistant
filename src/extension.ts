@@ -3,9 +3,6 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as https from 'https';
-import * as dotenv from 'dotenv';
-dotenv.config();
-
 // This method is called when your extension is activated
 // Your extension is activated the very first time the command is executed
 export function activate(context: vscode.ExtensionContext) {
@@ -44,11 +41,11 @@ export function activate(context: vscode.ExtensionContext) {
 					const { content, attachments } = message;
 					if (attachments && attachments.length > 0) {
 						const files = await readFilesFromWorkspace(attachments);
-						const aiReply = await callGeminiAPI(content, files);
+						const aiReply = await callGeminiAPI(context, content, files);
 						panel.webview.postMessage({ type: 'assistant-reply', content: aiReply });
 					} else {
 						// No files, just send prompt to Gemini
-						const aiReply = await callGeminiAPI(content, {});
+						const aiReply = await callGeminiAPI(context, content, {});
 						panel.webview.postMessage({ type: 'assistant-reply', content: aiReply });
 					}
 				} else if (message.type === 'get-workspace-files') {
@@ -76,13 +73,28 @@ export function activate(context: vscode.ExtensionContext) {
 	});
 
 	context.subscriptions.push(disposable);
+
+	// Command to set Gemini API Key
+	const setApiKeyDisposable = vscode.commands.registerCommand('chat-assistant.setGeminiApiKey', async () => {
+		const apiKey = await vscode.window.showInputBox({
+			prompt: 'Enter your Gemini API Key',
+			ignoreFocusOut: true,
+			password: true // To hide the input
+		});
+
+		if (apiKey) {
+			await context.secrets.store('geminiApiKey', apiKey);
+			vscode.window.showInformationMessage('Gemini API Key saved securely!');
+		} else {
+			vscode.window.showWarningMessage('Gemini API Key not set.');
+		}
+	});
+
+	context.subscriptions.push(setApiKeyDisposable);
 }
 
 // This method is called when your extension is deactivated
 export function deactivate() {}
-
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
-const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=' + GEMINI_API_KEY;
 
 function extractFileTokens(text: string): string[] {
 	const regex = /@([\w\-./\\]+)/g;
@@ -112,10 +124,17 @@ async function readFilesFromWorkspace(filePaths: string[]): Promise<{ [filename:
 	return result;
 }
 
-function callGeminiAPI(prompt: string, files: { [filename: string]: string }): Promise<string> {
+async function callGeminiAPI(context: vscode.ExtensionContext, prompt: string, files: { [filename: string]: string }): Promise<string> {
+	const GEMINI_API_KEY = await context.secrets.get('geminiApiKey');
+	if (!GEMINI_API_KEY) {
+		vscode.window.showErrorMessage('Gemini API Key not set. Please set it using the "Set Gemini API Key" command.');
+		return '[Gemini API Key not set]';
+	}
+	const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=' + GEMINI_API_KEY;
+
 	return new Promise((resolve, reject) => {
 		// Clean the user's prompt by removing the @file tokens for clarity.
-		const cleanPrompt = prompt.replace(/@[\w\-./\\]+/g, '').trim();
+		const cleanPrompt = prompt.replace(/@([\w\-./\\]+)/g, '').trim();
 
 		let fullPrompt: string;
 

@@ -16,6 +16,10 @@
             {
                 "command": "chat-assistant.open",
                 "title": "Open Inhouse Intelligence"
+            },
+            {
+                "command": "chat-assistant.setGeminiApiKey",
+                "title": "Set Gemini API Key"
             }
         ]
     },
@@ -46,8 +50,5 @@
         "eslint": "^9.25.1",
         "npm-run-all": "^4.1.5",
         "typescript": "^5.8.3"
-    },
-    "dependencies": {
-        "dotenv": "^16.5.0"
     }
 }
