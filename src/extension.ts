@@ -3,6 +3,21 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as https from 'https';
+
+function mapVSCodeThemeKindToShiki(themeKind: number): string {
+	switch (themeKind) {
+		case 1:
+			return 'github-light';
+		case 2:
+			return 'github-dark';
+		case 3:
+			return 'github-dark-high-contrast';
+		case 4:
+			return 'github-light-high-contrast';
+		default:
+			return 'github-dark';
+	}
+}
 // This method is called when your extension is activated
 // Your extension is activated the very first time the command is executed
 export function activate(context: vscode.ExtensionContext) {
@@ -32,13 +47,21 @@ export function activate(context: vscode.ExtensionContext) {
 		let html = fs.readFileSync(indexPath.fsPath, 'utf8');
 		html = html.replace('<head>', `<head><base href="${webviewUri}/">`);
 
+		// Get and inject the current theme into the HTML
+		html = html.replace('{{vscodeTheme}}', mapVSCodeThemeKindToShiki(vscode.window.activeColorTheme.kind));
 		panel.webview.html = html;
+
+		// Listen for theme changes and send to webview
+		context.subscriptions.push(vscode.window.onDidChangeActiveColorTheme(e => {
+			panel.webview.postMessage({ type: 'set-theme', theme: mapVSCodeThemeKindToShiki(e.kind) });
+		}));
 
 		// Message passing: Echo user message as assistant reply
 		panel.webview.onDidReceiveMessage(
 			async (message: any) => {
 				if (message.type === 'user-message') {
 					const { content, attachments } = message;
+                    console.log(message);
 					if (attachments && attachments.length > 0) {
 						const files = await readFilesFromWorkspace(attachments);
 						const aiReply = await callGeminiAPI(context, content, files);
@@ -52,16 +75,24 @@ export function activate(context: vscode.ExtensionContext) {
 					// Get all files in the workspace
 					const workspaceFolders = vscode.workspace.workspaceFolders;
 					if (workspaceFolders && workspaceFolders.length > 0) {
-						vscode.workspace.findFiles('**/*', '**/node_modules/**', 100)
-							.then(files => {
-								const fileMap: { [relativePath: string]: string } = {};
-								for (const file of files) {
-									// Ensure we don't have backslashes from windows
-									const relativePath = vscode.workspace.asRelativePath(file).replace(/\\/g, '/');
-									fileMap[relativePath] = file.fsPath;
-								}
-								panel.webview.postMessage({ type: 'workspace-files', files: fileMap });
-							});
+						const query = message.query || '';
+						let files: vscode.Uri[] = [];
+						const excludePattern = `**/{node_modules,.git,dist,build,out,.next,.vercel,.turbo,.cache,.vscode,test,tests,coverage,__pycache__}/**`;
+
+						if (query === '') {
+							// When only '@' is typed, show files at depth 0 or 1
+							files = await vscode.workspace.findFiles('{*,*/*}', excludePattern, 100); // Limit for initial display
+						} else {
+							// When query is present, perform a targeted search
+							files = await vscode.workspace.findFiles(`**/*${query}*`, excludePattern, 200); // Limit for targeted search
+						}
+
+						const fileMap: { [relativePath: string]: string } = {};
+						for (const file of files) {
+							const relativePath = vscode.workspace.asRelativePath(file).replace(/\\/g, '/');
+							fileMap[relativePath] = file.fsPath;
+						}
+						panel.webview.postMessage({ type: 'workspace-files', files: fileMap });
 					} else {
 						panel.webview.postMessage({ type: 'workspace-files', files: {} });
 					}
@@ -94,17 +125,7 @@ export function activate(context: vscode.ExtensionContext) {
 }
 
 // This method is called when your extension is deactivated
-export function deactivate() {}
-
-function extractFileTokens(text: string): string[] {
-	const regex = /@([\w\-./\\]+)/g;
-	const files = [];
-	let match;
-	while ((match = regex.exec(text)) !== null) {
-		files.push(match[1]);
-	}
-	return files;
-}
+export function deactivate() { }
 
 async function readFilesFromWorkspace(filePaths: string[]): Promise<{ [filename: string]: string }> {
 	const result: { [filename: string]: string } = {};
@@ -143,7 +164,7 @@ async function callGeminiAPI(context: vscode.ExtensionContext, prompt: string, f
 			const fileContext = Object.entries(files)
 				.map(([name, content]) => `Here is the content of the file '${name}':\n\`\`\`\n${content}\n\`\`\``)
 				.join('\n\n');
-			
+
 			// Construct the final prompt for the AI with file context.
 			fullPrompt = `The user's request is: "${cleanPrompt}"\n\nPlease use the following file content to fulfill the request:\n\n${fileContext}`;
 		} else {
@@ -169,21 +190,17 @@ async function callGeminiAPI(context: vscode.ExtensionContext, prompt: string, f
 				try {
 					const json = JSON.parse(body);
 					if (json.error) {
-						console.error('Gemini API error:', json.error);
 						resolve(`[Gemini Error] ${json.error.message || JSON.stringify(json.error)}`);
 						return;
 					}
 					const text = json.candidates?.[0]?.content?.parts?.[0]?.text || '[No response from Gemini]';
-					console.log('Gemini API response:', text);
 					resolve(text);
 				} catch (e) {
-					console.error('Gemini API parse error:', e, body);
 					resolve(`[Error parsing Gemini response] ${e}`);
 				}
 			});
 		});
 		req.on('error', (err) => {
-			console.error('Gemini API request error:', err);
 			resolve(`[Gemini Request Error] ${err}`);
 		});
 		req.write(data);

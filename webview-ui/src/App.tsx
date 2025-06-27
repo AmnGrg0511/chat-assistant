@@ -2,14 +2,15 @@ import { useState, useRef, useEffect } from 'react';
 import type { FormEvent, KeyboardEvent } from 'react';
 import './App.css';
 import { marked } from 'marked';
-import MonacoCodeBlock from './MonacoCodeBlock';
+import ShikiCodeBlock from './components/ShikiCodeBlock';
+import AutoResizeTextarea from './components/AutoResizeTextarea';
 
 const renderer = new marked.Renderer();
 renderer.code = ({ text, lang }) => {
   // Instead of returning HTML, return a placeholder for MonacoCodeBlock
   // We'll replace this placeholder in renderMarkdown
   const encoded = encodeURIComponent(JSON.stringify({ code: text, language: lang }));
-  return `<div data-monaco-code-block="${encoded}"></div>`;
+  return `<div data-shiki-code-block="${encoded}"></div>`;
 };
 marked.setOptions({ renderer });
 
@@ -35,15 +36,27 @@ function splitFilePath(path: string) {
   return { name, folder };
 }
 
+function debounce<T extends (...args: any[]) => void>(func: T, delay: number) {
+  let timeout: NodeJS.Timeout;
+  return function (this: ThisParameterType<T>, ...args: Parameters<T>) {
+    clearTimeout(timeout);
+    timeout = setTimeout(() => func.apply(this, args), delay);
+  };
+}
+
 function App() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
-  const [fileList, setFileList] = useState<string[]>([]);
-  const [fileMap, setFileMap] = useState<{ [relative: string]: string }>({});
+  const [fileList, setFileList] = useState<{ [relative: string]: string }>({});
+  const [selFiles, setSelFiles] = useState<{ [relative: string]: string }>({});
   const [showFileDropdown, setShowFileDropdown] = useState(false);
   const chatEndRef = useRef<HTMLDivElement | null>(null);
   const [selectedFileIdx, setSelectedFileIdx] = useState(0);
-  const inputRef = useRef<HTMLInputElement | null>(null);
+  const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  const [theme, setTheme] = useState(() => {
+    const metaTag = document.querySelector('meta[name="vscode-theme"]');
+    return metaTag ? metaTag.getAttribute('content') || 'vs-dark' : 'vs-dark';
+  });
 
   // Scroll to bottom on new message
   useEffect(() => {
@@ -56,8 +69,9 @@ function App() {
       if (event.data && event.data.type === 'assistant-reply') {
         setMessages((msgs) => [...msgs, { sender: 'assistant', content: event.data.content }]);
       } else if (event.data && event.data.type === 'workspace-files') {
-        setFileMap(event.data.files || {});
-        setFileList(Object.keys(event.data.files || {}));
+        setFileList(event.data.files);
+      } else if (event.data && event.data.type === 'set-theme') {
+        setTheme(event.data.theme);
       }
     };
     window.addEventListener('message', handler);
@@ -72,56 +86,39 @@ function App() {
 
     // Extract file tokens and resolve to absolute paths
     const attachments: string[] = [];
-    const regex = /@([\w\-./]+)/g;
-    const cleanInput = input.replace(regex, (_, token) => {
-      if (fileMap[token]) {
-        attachments.push(fileMap[token]);
+    let cleanedInput = input;
+    for (const relativePath of Object.keys(selFiles)) {
+      const token = `@${relativePath}`;
+      if (cleanedInput.includes(token)) {
+        attachments.push(selFiles[relativePath]);
+        cleanedInput = cleanedInput.replace(token, ''); // Remove the token from the message
       }
-      return token; // Keep the token in the message for context
-    });
-    
+    }
+
     // Send to extension
     if (vscode) {
       vscode.postMessage({
         type: 'user-message',
-        content: cleanInput,
+        content: cleanedInput.trim(),
         attachments,
       });
     }
     setInput('');
   };
 
-  // Extract the current @query for filtering
-  const getAtQuery = (value: string, cursor: number) => {
-    const atIdx = value.lastIndexOf('@', cursor - 1);
-    if (atIdx === -1) return '';
-    // Stop if there's a space or another @ after the last @
-    const afterAt = value.slice(atIdx + 1, cursor);
-    if (/\s|@/.test(afterAt)) return '';
-    return afterAt;
-  };
-
-  // Filtered file list for dropdown
-  const filteredFiles = (() => {
-    if (!showFileDropdown) return [];
-    const cursor = inputRef.current?.selectionStart || input.length;
-    const query = getAtQuery(input, cursor);
-    if (!query) return fileList;
-    return fileList.filter(f => f.toLowerCase().includes(query.toLowerCase()));
-  })();
-
   // Dropdown keyboard navigation
-  const handleInputKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
-    if (showFileDropdown && filteredFiles.length > 0) {
+  const handleInputKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    const files = Object.keys(fileList);
+    if (showFileDropdown && files.length > 0) {
       if (e.key === 'ArrowDown') {
         e.preventDefault();
-        setSelectedFileIdx(idx => (idx + 1) % filteredFiles.length);
+        setSelectedFileIdx(idx => (idx + 1) % files.length);
       } else if (e.key === 'ArrowUp') {
         e.preventDefault();
-        setSelectedFileIdx(idx => (idx - 1 + filteredFiles.length) % filteredFiles.length);
+        setSelectedFileIdx(idx => (idx - 1 + files.length) % files.length);
       } else if (e.key === 'Enter') {
         e.preventDefault();
-        handleFileSelect(filteredFiles[selectedFileIdx]);
+        handleFileSelect(files[selectedFileIdx], fileList[files[selectedFileIdx]]);
       } else if (e.key === 'Escape') {
         setShowFileDropdown(false);
       }
@@ -129,7 +126,7 @@ function App() {
   };
 
   // Insert @filename at cursor position
-  const handleFileSelect = (filename: string) => {
+  const handleFileSelect = (filename: string, path: string) => {
     if (!inputRef.current) return;
     const el = inputRef.current;
     const cursorPos = el.selectionStart || 0;
@@ -141,29 +138,26 @@ function App() {
     const newValue = before + filename + ' ' + after;
     setInput(newValue);
     setShowFileDropdown(false);
-    setTimeout(() => {
-      el.focus();
-      el.setSelectionRange(before.length + filename.length + 1, before.length + filename.length + 1);
-    }, 0);
+    setSelFiles(files => {return {...files, [filename]: path}});
   };
 
   // Request file list when user types '@' or types after '@'
-  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const debouncedGetWorkspaceFiles = useRef(debounce((query: string) => {
+    if (vscode)
+      vscode.postMessage({ type: 'get-workspace-files', query });
+  }, 300)).current;
+
+  const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const value = e.target.value;
     setInput(value);
     const cursor = e.target.selectionStart || value.length;
     const atIdx = value.lastIndexOf('@', cursor - 1);
     if (atIdx !== -1) {
-      // Only show dropdown if @ is not followed by space or another @
       const afterAt = value.slice(atIdx + 1, cursor);
-      if (!/\s|@/.test(afterAt)) {
-        setShowFileDropdown(true);
-        if (vscode) {
-          vscode.postMessage({ type: 'get-workspace-files' });
-        }
-        setSelectedFileIdx(0);
-        return;
-      }
+      setShowFileDropdown(true);
+      debouncedGetWorkspaceFiles(afterAt);
+      setSelectedFileIdx(0);
+      return;
     }
     setShowFileDropdown(false);
   };
@@ -173,15 +167,15 @@ function App() {
     if (msg.sender === 'user') {
       return <div key={idx} className={`chat-message user`}>{msg.content}</div>;
     }
-    // For assistant, parse the HTML and replace Monaco placeholders
+    // For assistant, parse the HTML and replace Shiki placeholders
     const rawHtml = marked.parse(msg.content) as string;
     const tempDiv = document.createElement('div');
     tempDiv.innerHTML = rawHtml;
     const nodes: React.ReactNode[] = [];
     tempDiv.childNodes.forEach((node, i) => {
-      if (node.nodeType === Node.ELEMENT_NODE && (node as HTMLElement).dataset.monacoCodeBlock) {
-        const { code, language } = JSON.parse(decodeURIComponent((node as HTMLElement).dataset.monacoCodeBlock!));
-        nodes.push(<MonacoCodeBlock key={i} code={code} language={language} />);
+      if (node.nodeType === Node.ELEMENT_NODE && (node as HTMLElement).dataset.shikiCodeBlock) {
+        const { code, language } = JSON.parse(decodeURIComponent((node as HTMLElement).dataset.shikiCodeBlock!));
+        nodes.push(<ShikiCodeBlock key={i} code={code} lang={language} theme={theme} />);
       } else {
         if (node instanceof HTMLElement) {
           nodes.push(<span key={i} dangerouslySetInnerHTML={{ __html: node.outerHTML }} />);
@@ -201,15 +195,15 @@ function App() {
       </div>
       <div className="chat-input-bar">
         <form className="chat-input" onSubmit={sendMessage} style={{ position: 'relative', width: '100%' }}>
-          {showFileDropdown && filteredFiles.length > 0 && (
+          {showFileDropdown && Object.keys(fileList).length > 0 && (
             <div className="file-dropdown file-dropdown-above">
-              {filteredFiles.map((file, idx) => {
+              {Object.keys(fileList).map((file, idx) => {
                 const { name, folder } = splitFilePath(file);
                 return (
                   <div
                     key={file}
                     className={idx === selectedFileIdx ? 'selected' : ''}
-                    onMouseDown={e => { e.preventDefault(); handleFileSelect(file); }}
+                    onMouseDown={e => { e.preventDefault(); handleFileSelect(file, fileList[file]); }}
                     onMouseEnter={() => setSelectedFileIdx(idx)}
                     style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
                   >
@@ -220,10 +214,12 @@ function App() {
               })}
             </div>
           )}
-          <input
+          <AutoResizeTextarea
             ref={inputRef}
-            type="text"
             value={input}
+            minRows={1}
+            maxRows={5}
+            autoFocus
             onChange={handleInputChange}
             onKeyDown={handleInputKeyDown}
             placeholder="Type a message..."
